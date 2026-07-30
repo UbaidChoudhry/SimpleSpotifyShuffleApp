@@ -1,0 +1,8 @@
+{
+  "platforms": ["apple"],
+  "apple": {
+    "podspecPath": "ios/ExpoSpotifyAppRemote.podspec",
+    "modules": ["ExpoSpotifyAppRemoteModule"],
+    "appDelegateSubscribers": ["SpotifyAppRemoteAppDelegateSubscriber"]
+  }
+}

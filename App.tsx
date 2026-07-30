@@ -1,10 +1,14 @@
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Linking, SafeAreaView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, TouchableOpacity } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import * as WebBrowser from 'expo-web-browser';
 import { clearTokens, isLoggedIn, login } from './src/auth';
+import { clearCurrentPlaylistId, loadCurrentPlaylistId } from './src/currentPlaylist';
 import { clearLikedSongsCache } from './src/likedSongsCache';
-import { shuffleLikedSongsIntoPlaylist } from './src/spotifyApi';
+import { NowPlayingScreen } from './src/NowPlayingScreen';
+import { shuffleLikedSongsIntoPlaylist, startPlaylistFromTop } from './src/spotifyApi';
+import { useSpotifyPlayer } from './src/spotifyPlayer';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -19,12 +23,53 @@ type Status =
 
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'checking' });
+  const player = useSpotifyPlayer();
 
   useEffect(() => {
-    isLoggedIn().then((loggedIn) => {
-      setStatus(loggedIn ? { kind: 'idle', playlistId: null, trackCount: null } : { kind: 'loggedOut' });
-    });
+    isLoggedIn()
+      .then(async (loggedIn) => {
+        if (!loggedIn) {
+          setStatus({ kind: 'loggedOut' });
+          return;
+        }
+        // Deliberately local-only: reading the remembered playlist ID is a file
+        // read, not a network call. Launch must never depend on Spotify being
+        // reachable or unthrottled — a rate-limited lookup here left the app
+        // frozen on the loading spinner with no way out.
+        const playlistId = await loadCurrentPlaylistId();
+        setStatus({ kind: 'idle', playlistId, trackCount: null });
+      })
+      .catch(() => {
+        // Never leave the UI stuck in 'checking' — shuffling still works from
+        // the idle state even if this failed.
+        setStatus({ kind: 'idle', playlistId: null, trackCount: null });
+      });
   }, []);
+
+  const handleShuffle = async () => {
+    // Reshuffling while already playing must restart playback — Spotify is
+    // already holding a queue built from the old order, so without this the
+    // rewrite is silent and the feature reads as broken rather than working.
+    const wasPlaying = player.connection === 'connected' && player.snapshot?.isPaused === false;
+    // Pause immediately, before the rewrite starts (which takes several
+    // seconds) rather than only once it's done — the old track shouldn't
+    // keep playing while the new order is being built. This also avoids a
+    // real bug: Spotify ignores play() on a context it thinks is already
+    // playing, so without pausing first, restarting afterward was a no-op.
+    if (wasPlaying) {
+      await player.pause();
+    }
+    try {
+      const result = await shuffleLikedSongsIntoPlaylist((message) => setStatus({ kind: 'busy', message }));
+      setStatus({ kind: 'idle', playlistId: result.playlistId, trackCount: result.trackCount });
+      if (wasPlaying) {
+        await player.setShuffleOff();
+        await startPlaylistFromTop(result.playlistId);
+      }
+    } catch (err) {
+      setStatus({ kind: 'error', message: err instanceof Error ? err.message : 'Shuffle failed.' });
+    }
+  };
 
   const handleConnect = async () => {
     setStatus({ kind: 'busy', message: 'Connecting to Spotify...' });
@@ -33,15 +78,6 @@ export default function App() {
       setStatus({ kind: 'idle', playlistId: null, trackCount: null });
     } catch (err) {
       setStatus({ kind: 'error', message: err instanceof Error ? err.message : 'Login failed.' });
-    }
-  };
-
-  const handleShuffle = async () => {
-    try {
-      const result = await shuffleLikedSongsIntoPlaylist((message) => setStatus({ kind: 'busy', message }));
-      setStatus({ kind: 'idle', playlistId: result.playlistId, trackCount: result.trackCount });
-    } catch (err) {
-      setStatus({ kind: 'error', message: err instanceof Error ? err.message : 'Shuffle failed.' });
     }
   };
 
@@ -57,90 +93,78 @@ export default function App() {
   };
 
   const handleLogOut = async () => {
+    await player.disconnect();
+    // Otherwise the next account inherits a pointer to a playlist it doesn't own.
+    await clearCurrentPlaylistId();
     await clearTokens();
     setStatus({ kind: 'loggedOut' });
   };
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaProvider>
       <StatusBar style="light" />
-      <Text style={styles.title}>Pure Shuffle</Text>
-      <Text style={styles.subtitle}>A truly random shuffle of your Liked Songs</Text>
+      {status.kind === 'idle' && status.playlistId != null ? (
+        <NowPlayingScreen
+          player={player}
+          playlistId={status.playlistId}
+          trackCount={status.trackCount}
+          notice={status.notice ?? null}
+          onReshuffle={handleShuffle}
+          onClearCache={handleClearCache}
+          onLogOut={handleLogOut}
+        />
+      ) : (
+        <SafeAreaView style={styles.container}>
+          <Text style={styles.title}>Pure Shuffle</Text>
+          <Text style={styles.subtitle}>A truly random shuffle of your Liked Songs</Text>
 
-      <View style={styles.content}>
-        {status.kind === 'checking' && <ActivityIndicator color="#1DB954" />}
+          {status.kind === 'checking' && <ActivityIndicator color="#1DB954" style={styles.spacerTop} />}
 
-        {status.kind === 'loggedOut' && (
-          <TouchableOpacity style={styles.button} onPress={handleConnect}>
-            <Text style={styles.buttonText}>Connect Spotify</Text>
-          </TouchableOpacity>
-        )}
-
-        {status.kind === 'busy' && (
-          <>
-            <ActivityIndicator color="#1DB954" />
-            <Text style={styles.status}>{status.message}</Text>
-          </>
-        )}
-
-        {status.kind === 'error' && (
-          <>
-            <Text style={styles.error}>{status.message}</Text>
-            <TouchableOpacity style={styles.button} onPress={handleShuffle}>
-              <Text style={styles.buttonText}>Try Again</Text>
+          {status.kind === 'loggedOut' && (
+            <TouchableOpacity style={[styles.button, styles.spacerTop]} onPress={handleConnect}>
+              <Text style={styles.buttonText}>Connect Spotify</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.clearCacheButton} onPress={handleClearCache}>
-              <Text style={styles.clearCacheText}>Clear cached library</Text>
-            </TouchableOpacity>
-          </>
-        )}
+          )}
 
-        {status.kind === 'idle' && (
-          <>
-            <TouchableOpacity style={styles.button} onPress={handleShuffle}>
+          {status.kind === 'busy' && (
+            <>
+              <ActivityIndicator color="#1DB954" style={styles.spacerTop} />
+              <Text style={styles.status}>{status.message}</Text>
+            </>
+          )}
+
+          {status.kind === 'error' && (
+            <>
+              <Text style={[styles.error, styles.spacerTop]}>{status.message}</Text>
+              <TouchableOpacity style={styles.button} onPress={handleShuffle}>
+                <Text style={styles.buttonText}>Try Again</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.clearCacheButton} onPress={handleClearCache}>
+                <Text style={styles.clearCacheText}>Clear cached library</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {status.kind === 'idle' && (
+            // playlistId == null here — a fresh login with nothing shuffled yet.
+            <TouchableOpacity style={[styles.button, styles.spacerTop]} onPress={handleShuffle}>
               <Text style={styles.buttonText}>Shuffle Now</Text>
             </TouchableOpacity>
-
-            {status.trackCount != null && (
-              <Text style={styles.status}>Shuffled {status.trackCount} songs into "Pure Shuffle"</Text>
-            )}
-
-            {status.notice != null && <Text style={styles.notice}>{status.notice}</Text>}
-
-            {status.playlistId != null && (
-              <TouchableOpacity
-                style={styles.secondaryButton}
-                onPress={() => Linking.openURL(`spotify:playlist:${status.playlistId}`)}
-              >
-                <Text style={styles.secondaryButtonText}>Open in Spotify</Text>
-              </TouchableOpacity>
-            )}
-
-            <TouchableOpacity style={styles.clearCacheButton} onPress={handleClearCache}>
-              <Text style={styles.clearCacheText}>Clear cached library</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.logOutButton} onPress={handleLogOut}>
-              <Text style={styles.logOutText}>Log out</Text>
-            </TouchableOpacity>
-          </>
-        )}
-      </View>
-    </SafeAreaView>
+          )}
+        </SafeAreaView>
+      )}
+    </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#121212', alignItems: 'center', paddingTop: 80, paddingHorizontal: 24 },
+  container: { flex: 1, backgroundColor: '#08090c', alignItems: 'center', paddingTop: 80, paddingHorizontal: 24 },
   title: { color: '#fff', fontSize: 28, fontWeight: '700' },
-  subtitle: { color: '#b3b3b3', fontSize: 14, marginTop: 8, textAlign: 'center' },
-  content: { marginTop: 60, alignItems: 'center', width: '100%' },
+  subtitle: { color: '#84868c', fontSize: 14, marginTop: 8, textAlign: 'center' },
+  spacerTop: { marginTop: 60 },
   button: { backgroundColor: '#1DB954', paddingVertical: 14, paddingHorizontal: 32, borderRadius: 30 },
   buttonText: { color: '#000', fontSize: 16, fontWeight: '700' },
-  secondaryButton: { marginTop: 16, paddingVertical: 10 },
-  secondaryButtonText: { color: '#1DB954', fontSize: 15, fontWeight: '600' },
   status: { color: '#fff', fontSize: 14, marginTop: 16, textAlign: 'center' },
-  notice: { color: '#b3b3b3', fontSize: 13, marginTop: 16, textAlign: 'center' },
   error: { color: '#f15e6c', fontSize: 14, marginBottom: 16, textAlign: 'center' },
   clearCacheButton: {
     marginTop: 28,
@@ -150,7 +174,5 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#333',
   },
-  clearCacheText: { color: '#b3b3b3', fontSize: 13, fontWeight: '600' },
-  logOutButton: { marginTop: 40 },
-  logOutText: { color: '#666', fontSize: 13 },
+  clearCacheText: { color: '#84868c', fontSize: 13, fontWeight: '600' },
 });

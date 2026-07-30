@@ -1,8 +1,16 @@
 // The client ID is read from .env, which is untracked, so it stays out of the repo.
 // Copy .env.example to .env and paste the ID from https://developer.spotify.com/dashboard.
-// Register this exact redirect URI in that app's settings.
+// Register both redirect URIs below in that app's settings.
 export const SPOTIFY_CLIENT_ID = process.env.EXPO_PUBLIC_SPOTIFY_CLIENT_ID ?? '';
 export const REDIRECT_URI = 'pureshuffle://callback';
+
+// A distinct URI for the App Remote SDK's own authorization handshake, kept
+// separate from REDIRECT_URI above. The Web API PKCE login never touches
+// AppDelegate's open-URL handler (it runs inside ASWebAuthenticationSession),
+// while App Remote app-switches to Spotify and comes back through it — a
+// shared URI would let the native handler attempt to parse an unrelated PKCE
+// callback, since SPTAppRemote only validates the scheme, not the full path.
+export const APP_REMOTE_REDIRECT_URI = 'pureshuffle://spotify-app-remote-callback';
 
 // .env is read at bundle time, so a missing ID shows up as an empty string here
 // rather than as a network error deep in the auth flow.
@@ -19,6 +27,15 @@ export const SCOPES = [
   'playlist-modify-public',
   'playlist-modify-private',
   'playlist-read-private',
+  // Requested here too (not just by the App Remote SDK's own authorizeAndPlayURI
+  // call) so a first-time login shows one consent screen instead of two.
+  'app-remote-control',
+  // Needed only to restart playback after a reshuffle. The local Spotify app
+  // caches playlist contents and serves the stale order until it's manually
+  // refreshed, so every App Remote play call replayed the pre-shuffle list.
+  // Server-side playback control resolves the playlist fresh and bypasses
+  // that cache entirely.
+  'user-modify-playback-state',
 ];
 
 export const PLAYLIST_NAME = 'Pure Shuffle';

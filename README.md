@@ -8,7 +8,7 @@ Spotify's built-in shuffle is not a uniform random permutation. It reorders play
 
 Pure Shuffle sidesteps that entirely. It reads your Liked Songs, shuffles them with a **Fisher-Yates** permutation driven by a seeded PRNG, and writes the result into a playlist called **Pure Shuffle** in that exact order.
 
-You then play that playlist **with Spotify's own shuffle turned OFF**. The randomness is already baked into the track order, so Spotify just plays it top to bottom. Tap the button again whenever you want a fresh permutation.
+You then play it — either in-app or in Spotify itself — **with Spotify's own shuffle turned OFF**. The randomness is already baked into the track order, so Spotify just plays it top to bottom. Tap Reshuffle whenever you want a fresh permutation; if you're already playing, it restarts from the new track 1.
 
 The shuffle itself is in [`src/shuffle.ts`](src/shuffle.ts) — a mulberry32 PRNG plus a standard Fisher-Yates loop. Notably it does *not* use `array.sort(() => Math.random() - 0.5)`, which is biased and leaves runs of adjacent tracks intact.
 
@@ -24,11 +24,12 @@ The shuffle itself is in [`src/shuffle.ts`](src/shuffle.ts) — a mulberry32 PRN
 
 Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and create an app, then:
 
-- Under **Edit Settings → Redirect URIs**, add exactly:
+- Under **Edit Settings → Redirect URIs**, add **both**:
   ```
   pureshuffle://callback
+  pureshuffle://spotify-app-remote-callback
   ```
-  This must match `REDIRECT_URI` in [`src/config.ts`](src/config.ts) and the `scheme` in [`app.json`](app.json). A mismatch fails at the authorize step with `INVALID_CLIENT`.
+  The first is the Web API login; the second is the in-app player's own authorization handshake — they're deliberately separate (see [In-app player](#in-app-player) below). Both must match `REDIRECT_URI` / `APP_REMOTE_REDIRECT_URI` in [`src/config.ts`](src/config.ts) and the `scheme` in [`app.json`](app.json) exactly. A mismatch fails at the authorize step with `INVALID_CLIENT`.
 - Under **User Management**, add the Spotify account you'll log in with. Development-mode apps only authorize explicitly listed accounts.
 
 Copy the **Client ID**. There is no client secret — see [Authentication](#authentication) below.
@@ -63,13 +64,17 @@ npm run ios
 
 This builds the native app and installs it on a simulator. First build takes several minutes; subsequent runs are much faster.
 
-Once it's running, tap **Connect Spotify**, complete the login, then **Shuffle Now**.
+Once it's running, tap **Connect Spotify**, complete the login, then **Shuffle Now**. The in-app player itself won't connect on a simulator — see [In-app player](#in-app-player) — but everything else (shuffling, caching, playlist writes) works there.
 
 ## Running on a physical device
 
-Needed for testing the "Open in Spotify" deep link, which can't work on a simulator (no Spotify app installed there).
+A physical device is required to test the in-app player (App Remote can't connect on a simulator at all) and the "Open in Spotify" deep link (no Spotify app installed on a simulator).
 
 ```bash
+# Everyday iteration — Metro attached, JS fast-refreshes, phone and Mac on the same network
+npm run ios -- --device --configuration Debug
+
+# Final verification / standalone install
 npm run ios -- --device --configuration Release
 ```
 
@@ -80,7 +85,7 @@ Requirements:
 - **Developer Mode** enabled on the phone (Settings → Privacy & Security → Developer Mode), then reboot.
 - After install, trust the certificate: Settings → General → VPN & Device Management → your developer profile → **Trust**.
 
-`Release` is recommended over the default `Debug` because it bundles the JavaScript into the binary, so the app runs standalone instead of needing Metro on the same network.
+Use `Debug` while iterating on the player — JS changes fast-refresh over Metro without a native rebuild. Switch to `Release` for final verification or standalone use: it bundles the JavaScript into the binary, so the app runs without Metro at all.
 
 With a free Apple account, builds stop launching after **7 days**. Rerun the command to reinstall.
 
@@ -116,6 +121,48 @@ Two safeguards:
 
 The algorithm lives in [`src/likedSongsSync.ts`](src/likedSongsSync.ts) and takes its page fetcher as a parameter, so it has no network or filesystem dependencies and can be tested in isolation.
 
+### In-app player
+
+Playback is controlled with Spotify's **App Remote SDK** (`SPTAppRemote`), not the Web API's `/me/player` endpoints — the latter can't reliably start playback from a cold start on a device that isn't already an active Spotify Connect target. App Remote instead app-switches to the Spotify app itself to authorize and play.
+
+This means **two separate authorization handshakes** exist side by side:
+
+| | Web API login | In-app player |
+|---|---|---|
+| Flow | PKCE via `ASWebAuthenticationSession` | App Remote via app-switch to Spotify |
+| Redirect URI | `pureshuffle://callback` | `pureshuffle://spotify-app-remote-callback` |
+| Touches `AppDelegate`? | No | Yes — Spotify calls back into the app's URL scheme |
+| Token stored at | `spotify_access_token` (Keychain) | `spotify_app_remote_token` (Keychain) |
+
+They're deliberately kept on distinct redirect URIs. `SPTAppRemote` only validates the URL *scheme*, not the full path, so sharing one URI would let the App Remote handler attempt to parse an unrelated PKCE callback.
+
+The native SDK is wrapped in a local Expo Module at [`modules/spotify-app-remote/`](modules/spotify-app-remote/) — not the community `react-native-spotify-remote` package, which has no confirmed support for React Native's New Architecture (enabled in this project). The wrapper wires an `ExpoAppDelegateSubscriber` to catch the App Remote callback, and exposes play/pause/skip/seek plus a player-state event stream to [`src/spotifyPlayer.ts`](src/spotifyPlayer.ts), which layers on progress-bar interpolation (the SDK only pushes state on discrete changes, not continuously) and reconnect-on-foreground.
+
+The SDK itself is vendored via CocoaPods' `apple.extraPods` mechanism, fetched directly from [spotify/ios-sdk](https://github.com/spotify/ios-sdk) at a pinned tag — nothing is committed to this repo, and `ios/` is gitignored regardless.
+
+**Cannot be tested in the iOS Simulator.** App Remote requires the real Spotify app to be running; on a simulator, `isSpotifyInstalled()` correctly reports `false` and the UI shows an install prompt, but the connection itself is only testable on a physical device.
+
+The app also calls `setShuffle(false)` on every connect — enforcing the "play with shuffle off" rule above programmatically rather than only documenting it.
+
+### Why a new playlist each time
+
+Each shuffle writes into a **freshly created** playlist and deletes the previous one, rather than rewriting a single stable playlist. This looks wasteful and isn't — it's the only thing that makes reshuffling actually work.
+
+The Spotify client caches playlist contents keyed by URI, and there is no API to invalidate that cache. Rewriting the same playlist updates it on Spotify's servers, but the phone keeps serving its stale copy until you manually open the playlist in the Spotify app and refresh it. So a reshuffle would rewrite the playlist correctly and then keep playing the *old* order.
+
+That cache sits below both control planes, so no play command can route around it. All of these were tried and all failed identically:
+
+| Approach | Result |
+|---|---|
+| App Remote `play(playlistUri)` | plays stale cached order |
+| App Remote `play(trackUri)` | correct track, but no queue — playback stops after one song |
+| App Remote `fetchContentItem` + `play(item, skipToTrackIndex: 0)` | plays stale cached order |
+| Web API `PUT /me/player/play` with `context_uri` | command accepted, client still plays stale cached order |
+
+A URI the client has never seen has nothing cached, so it must fetch the real contents. Hence: new playlist, every time.
+
+Restart-after-reshuffle uses the Web API's `PUT /me/player/play` ([`startPlaylistFromTop`](src/spotifyApi.ts)) rather than App Remote. Note this does not contradict the "never use `/me/player/*` for cold start" rule in [CLAUDE.md](CLAUDE.md) — cold start still goes through `SPTAppRemote.authorizeAndPlayURI`; this is only the warm-session restart, and it needs the `user-modify-playback-state` scope.
+
 ### Cache storage
 
 A single JSON file, `liked-songs-cache.json`, in the app's Documents directory via `expo-file-system` (~75KB for 2,000 tracks). Documents rather than Caches, because iOS may purge the cache directory under storage pressure and silently force a full resync.
@@ -125,21 +172,27 @@ The cache is versioned and validated on read. Anything corrupt or unrecognized i
 ## Project layout
 
 ```
-App.tsx                    UI and state machine
-src/config.ts              Client ID, redirect URI, scopes, playlist name
-src/auth.ts                PKCE login, token refresh, Keychain storage
-src/spotifyApi.ts          Spotify HTTP calls and sync orchestration
-src/likedSongsSync.ts      Delta-sync algorithm (pure, no I/O)
-src/likedSongsCache.ts     Cache persistence
-src/shuffle.ts             Seeded Fisher-Yates
+App.tsx                              UI and state machine
+src/config.ts                        Client ID, redirect URIs, scopes, playlist name
+src/auth.ts                          PKCE login, token refresh, Keychain storage
+src/spotifyApi.ts                    Spotify HTTP calls and sync orchestration
+src/likedSongsSync.ts                Delta-sync algorithm (pure, no I/O)
+src/likedSongsCache.ts               Cache persistence
+src/shuffle.ts                       Seeded Fisher-Yates
+src/spotifyPlayer.ts                 In-app player hook (progress interpolation, lifecycle)
+src/PlayerBar.tsx                    In-app player UI
+modules/spotify-app-remote/          Local Expo Module wrapping SPTAppRemote (native SDK)
 ```
 
 ## Notes and limitations
 
-- **Play with Spotify shuffle off.** The point is that the order is already random. Leaving shuffle on re-randomizes it with the same biased algorithm this project exists to avoid.
-- **The playlist is fully rewritten each run.** The first write replaces the playlist's contents and subsequent chunks append, ~20 requests for 2,000 tracks. This isn't transactional — a network failure mid-write can leave the playlist partially populated. Running the shuffle again fixes it.
+- **Play with Spotify shuffle off.** The point is that the order is already random. Leaving shuffle on re-randomizes it with the same biased algorithm this project exists to avoid. The in-app player enforces this on connect; if you play from the Spotify app directly instead, you need to turn shuffle off yourself.
+- **Each shuffle creates a new playlist and deletes the previous one**, so the playlist link changes every time. This is deliberate and load-bearing — see [Why a new playlist each time](#why-a-new-playlist-each-time). Anything you pin or save pointing at a specific "Pure Shuffle" playlist will break on the next shuffle; the app's own "Open in Spotify" always targets the current one.
+- **The playlist can't be downloaded for offline listening.** Spotify exposes no API for it — offline state is read-only in the App Remote SDK and absent from the Web API entirely — and a new playlist each shuffle would lose any manual download anyway.
+- **Writes aren't transactional.** The first write sets the playlist's contents and subsequent chunks append, ~20 requests for 2,000 tracks. A network failure mid-write can leave a partially populated playlist; running the shuffle again fixes it. The previous playlist is only deleted after the replacement is fully written, so a failure never leaves you with nothing.
 - **Transient `503`s.** Spotify's API returns intermittent 5xx errors. The client retries on `429` but not on 5xx, so an unlucky run can fail outright. Retrying usually succeeds.
 - **iOS only, so far.** An Android script exists (`npm run android`) but has not been tested.
+- **In-app playback requires Spotify Premium and the Spotify app installed**, in addition to being logged in. Without the app, the UI falls back to an install prompt; you can still shuffle and use "Open in Spotify" either way.
 
 ## License
 

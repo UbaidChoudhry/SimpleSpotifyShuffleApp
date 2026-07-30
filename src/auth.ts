@@ -2,6 +2,7 @@ import * as AuthSession from 'expo-auth-session';
 import * as SecureStore from 'expo-secure-store';
 import { assertClientIdConfigured, REDIRECT_URI, SCOPES, SPOTIFY_CLIENT_ID } from './config';
 import { clearLikedSongsCache } from './likedSongsCache';
+import { clearAppRemoteToken } from './spotifyPlayer';
 
 const DISCOVERY = {
   authorizationEndpoint: 'https://accounts.spotify.com/authorize',
@@ -42,8 +43,9 @@ export async function clearTokens(): Promise<void> {
     SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY),
     SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY),
     SecureStore.deleteItemAsync(EXPIRES_AT_KEY),
-    // Otherwise the next account to log in would inherit this library.
+    // Otherwise the next account to log in would inherit this library or session.
     clearLikedSongsCache(),
+    clearAppRemoteToken(),
   ]);
 }
 
@@ -115,6 +117,23 @@ export async function getValidAccessToken(): Promise<string> {
   }
   if (Date.now() < tokens.expiresAt - EXPIRY_BUFFER_MS) {
     return tokens.accessToken;
+  }
+  const refreshed = await refreshTokens(tokens.refreshToken);
+  return refreshed.accessToken;
+}
+
+/**
+ * Refreshes regardless of the locally-tracked expiry.
+ *
+ * A token can be rejected server-side while still looking valid here — for
+ * example after re-authorizing with a different scope set, which is exactly
+ * when the stored token silently stops working. Callers use this to recover
+ * from a 401 rather than surfacing it to the user.
+ */
+export async function forceRefreshAccessToken(): Promise<string> {
+  const tokens = await loadTokens();
+  if (!tokens) {
+    throw new Error('Not connected to Spotify.');
   }
   const refreshed = await refreshTokens(tokens.refreshToken);
   return refreshed.accessToken;
