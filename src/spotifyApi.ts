@@ -1,6 +1,11 @@
 import { forceRefreshAccessToken, getValidAccessToken } from './auth';
 import { loadCurrentPlaylistId, saveCurrentPlaylistId } from './currentPlaylist';
-import { PLAYLIST_DESCRIPTION, PLAYLIST_NAME } from './config';
+import {
+  MAX_REQUESTS_PER_SECOND,
+  PLAYLIST_DESCRIPTION,
+  PLAYLIST_NAME,
+  RATE_LIMIT_COOLDOWN_SECONDS,
+} from './config';
 import { loadLikedSongsCache, saveLikedSongsCache } from './likedSongsCache';
 import { fullSync, LIKED_SONGS_PAGE_SIZE, SavedTracksPage, tryIncrementalSync } from './likedSongsSync';
 import { randomSeed, seededShuffle } from './shuffle';
@@ -18,12 +23,62 @@ function formatDuration(seconds: number): string {
   return `${Math.round((seconds / 3600) * 10) / 10} hours`;
 }
 
+// Earliest wall-clock time the next request may start. Spacing requests evenly
+// rather than using a token bucket keeps bursts from forming at all, which is
+// what a rolling-window quota like Spotify's actually penalises.
+let nextRequestAllowedAt = 0;
+
+// Circuit breaker. Spotify's quota is a rolling window, so continuing to send
+// requests after the first 429 is what escalates a brief throttle into a
+// multi-hour lockout. The first rejection trips this and all outbound calls
+// fail immediately until it clears — the app stops digging.
+let circuitOpenUntil = 0;
+
+function circuitRemainingSeconds(): number {
+  return Math.max(0, Math.ceil((circuitOpenUntil - Date.now()) / 1000));
+}
+
+/** Trips the breaker for at least the cooldown, longer if Spotify asked for more. */
+function tripCircuit(retryAfterSeconds: number): number {
+  const cooldownMs = Math.max(RATE_LIMIT_COOLDOWN_SECONDS, retryAfterSeconds + 1) * 1000;
+  circuitOpenUntil = Math.max(circuitOpenUntil, Date.now() + cooldownMs);
+  return cooldownMs;
+}
+
+/**
+ * Blocks until this caller's slot in the outbound rate limit comes up.
+ *
+ * The slot is claimed synchronously — before any await — so concurrent callers
+ * each reserve a distinct slot instead of all reading the same timestamp and
+ * firing together.
+ */
+async function acquireRequestSlot(): Promise<void> {
+  const minIntervalMs = 1000 / MAX_REQUESTS_PER_SECOND;
+  const now = Date.now();
+  const startAt = Math.max(now, nextRequestAllowedAt);
+  nextRequestAllowedAt = startAt + minIntervalMs;
+
+  const waitMs = startAt - now;
+  if (waitMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
 async function spotifyFetch(
   path: string,
   options: RequestInit = {},
   alreadyRetriedAfter401 = false
 ): Promise<Response> {
+  // Refuse to send anything while the breaker is open — that's the whole point
+  // of tripping it.
+  if (circuitRemainingSeconds() > 0) {
+    throw new Error(
+      `Spotify rate limit hit. Paused for another ${formatDuration(circuitRemainingSeconds())}.`
+    );
+  }
+
   const accessToken = await getValidAccessToken();
+  await acquireRequestSlot();
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
@@ -35,7 +90,11 @@ async function spotifyFetch(
 
   if (response.status === 429) {
     const retryAfterSec = Number(response.headers.get('Retry-After') ?? '1');
-    console.log(`[spotify] rate limited on ${options.method ?? 'GET'} ${path}, retry after ${retryAfterSec}s`);
+    const cooldownMs = tripCircuit(retryAfterSec);
+    console.log(
+      `[spotify] rate limited on ${options.method ?? 'GET'} ${path} ` +
+        `(retry-after ${retryAfterSec}s) — pausing all requests for ${Math.round(cooldownMs / 1000)}s`
+    );
 
     if (retryAfterSec > MAX_RETRY_AFTER_SECONDS) {
       throw new Error(
@@ -44,7 +103,10 @@ async function spotifyFetch(
       );
     }
 
-    await new Promise((resolve) => setTimeout(resolve, (retryAfterSec + 1) * 1000));
+    // Wait out the breaker before retrying, rather than failing outright: a
+    // shuffle abandoned mid-write leaves a partially populated playlist, which
+    // is worse than a slow one.
+    await new Promise((resolve) => setTimeout(resolve, cooldownMs));
     return spotifyFetch(path, options, alreadyRetriedAfter401);
   }
 

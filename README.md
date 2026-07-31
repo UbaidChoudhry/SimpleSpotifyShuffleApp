@@ -54,6 +54,14 @@ EXPO_PUBLIC_SPOTIFY_CLIENT_ID=your_client_id_here
 
 `.env` is gitignored. `.env.example` is committed as the template.
 
+An optional second setting caps outbound Spotify Web API requests per second (default `20` if unset):
+
+```
+EXPO_PUBLIC_SPOTIFY_MAX_TPS=20
+```
+
+Lower it if you start seeing `429` responses. Note this caps request *rate*, not total request count — Spotify's quota is a rolling window over the total, so the bigger lever is [avoiding unnecessary calls](#why-a-new-playlist-each-time) rather than pacing them.
+
 > **Environment variables are inlined at bundle time, not hot-reloaded.** After editing `.env` you must fully restart the dev server — pressing `r` in Metro or `⌘R` in the simulator is not enough. You'll know it worked when startup logs `env: load .env`.
 
 ### 5. Run
@@ -191,6 +199,7 @@ modules/spotify-app-remote/          Local Expo Module wrapping SPTAppRemote (na
 - **The playlist can't be downloaded for offline listening.** Spotify exposes no API for it — offline state is read-only in the App Remote SDK and absent from the Web API entirely — and a new playlist each shuffle would lose any manual download anyway.
 - **Writes aren't transactional.** The first write sets the playlist's contents and subsequent chunks append, ~20 requests for 2,000 tracks. A network failure mid-write can leave a partially populated playlist; running the shuffle again fixes it. The previous playlist is only deleted after the replacement is fully written, so a failure never leaves you with nothing.
 - **Transient `503`s.** Spotify's API returns intermittent 5xx errors. The client retries on `429` but not on 5xx, so an unlucky run can fail outright. Retrying usually succeeds.
+- **Rate limiting can lock the app out for hours.** Spotify answers a `429` with a `Retry-After`, and when an app exceeds its rolling quota that value can be *hours* — 14+ has been observed in practice on a dev-mode app. Three defences: a circuit breaker halts all requests for 30s after the first `429` (continuing to probe is what escalates a throttle into a lockout), waits longer than 60s fail fast rather than sleeping (which is indistinguishable from a frozen app), and launch makes no network calls at all so a throttled account can't strand the UI on a loading spinner. Once locked out, nothing clears it but time.
 - **iOS only, so far.** An Android script exists (`npm run android`) but has not been tested.
 - **In-app playback requires Spotify Premium and the Spotify app installed**, in addition to being logged in. Without the app, the UI falls back to an install prompt; you can still shuffle and use "Open in Spotify" either way.
 
