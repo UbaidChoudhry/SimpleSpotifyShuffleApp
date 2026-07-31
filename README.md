@@ -8,7 +8,7 @@ Spotify's built-in shuffle is not a uniform random permutation. It reorders play
 
 Pure Shuffle sidesteps that entirely. It reads your Liked Songs, shuffles them with a **Fisher-Yates** permutation driven by a seeded PRNG, and writes the result into a playlist called **Pure Shuffle** in that exact order.
 
-You then play it — either in-app or in Spotify itself — **with Spotify's own shuffle turned OFF**. The randomness is already baked into the track order, so Spotify just plays it top to bottom. Tap Reshuffle whenever you want a fresh permutation; if you're already playing, it restarts from the new track 1.
+You then play it — either in-app or in Spotify itself — **with Spotify's own shuffle turned OFF**. The randomness is already baked into the track order, so Spotify just plays it top to bottom. Tap Reshuffle whenever you want a fresh permutation; whenever the in-app player is connected it restarts from the new track 1 — see [Reshuffle and playback](#reshuffle-and-playback).
 
 The shuffle itself is in [`src/shuffle.ts`](src/shuffle.ts) — a mulberry32 PRNG plus a standard Fisher-Yates loop. Notably it does *not* use `array.sort(() => Math.random() - 0.5)`, which is biased and leaves runs of adjacent tracks intact.
 
@@ -171,6 +171,16 @@ A URI the client has never seen has nothing cached, so it must fetch the real co
 
 Restart-after-reshuffle uses the Web API's `PUT /me/player/play` ([`startPlaylistFromTop`](src/spotifyApi.ts)) rather than App Remote. Note this does not contradict the "never use `/me/player/*` for cold start" rule in [CLAUDE.md](CLAUDE.md) — cold start still goes through `SPTAppRemote.authorizeAndPlayURI`; this is only the warm-session restart, and it needs the `user-modify-playback-state` scope.
 
+### Reshuffle and playback
+
+Because each shuffle lands in a brand-new playlist, Spotify is left holding a queue built from the **old** order until something explicitly repoints it. So whenever the in-app player is connected, a reshuffle ends by pointing playback at the new playlist and starting it from track 1.
+
+The condition is *connected*, not *currently playing*. Gating it on "was playing" is the obvious-looking shortcut and it is wrong: reshuffling while paused would rewrite everything, delete the old playlist, and then leave the next tap on Play resuming the pre-shuffle order — from a playlist that no longer exists.
+
+**A consequence worth knowing: reshuffling while paused starts playback.** Spotify offers no way to load a context without playing it. The tempting alternative — play, then immediately pause — races two independent commands, and when the pause loses the race it is discarded against a device that hadn't started yet, leaving the phone playing with no pause on the way. Starting playback is the predictable behaviour; the race is not.
+
+One fallback exists on this path. Server-side playback needs a device Spotify still counts as *active*, and a session left paused for a few minutes stops being one — exactly the state a paused reshuffle runs in. That case surfaces as `NoActiveDeviceError` and falls back to App Remote, which can wake the local Spotify app. Every other playback failure propagates.
+
 ### Cache storage
 
 A single JSON file, `liked-songs-cache.json`, in the app's Documents directory via `expo-file-system` (~75KB for 2,000 tracks). Documents rather than Caches, because iOS may purge the cache directory under storage pressure and silently force a full resync.
@@ -187,8 +197,12 @@ src/spotifyApi.ts                    Spotify HTTP calls and sync orchestration
 src/likedSongsSync.ts                Delta-sync algorithm (pure, no I/O)
 src/likedSongsCache.ts               Cache persistence
 src/shuffle.ts                       Seeded Fisher-Yates
+src/currentPlaylist.ts               Remembers the current playlist ID (local file)
 src/spotifyPlayer.ts                 In-app player hook (progress interpolation, lifecycle)
-src/PlayerBar.tsx                    In-app player UI
+src/NowPlayingScreen.tsx             In-app player UI
+src/ProgressBar.tsx                  Seekable progress bar
+src/icons.tsx                        SVG icons
+src/theme.ts                         Colours, per-track accent derivation
 modules/spotify-app-remote/          Local Expo Module wrapping SPTAppRemote (native SDK)
 ```
 
@@ -198,6 +212,8 @@ modules/spotify-app-remote/          Local Expo Module wrapping SPTAppRemote (na
 - **Each shuffle creates a new playlist and deletes the previous one**, so the playlist link changes every time. This is deliberate and load-bearing — see [Why a new playlist each time](#why-a-new-playlist-each-time). Anything you pin or save pointing at a specific "Pure Shuffle" playlist will break on the next shuffle; the app's own "Open in Spotify" always targets the current one.
 - **The playlist can't be downloaded for offline listening.** Spotify exposes no API for it — offline state is read-only in the App Remote SDK and absent from the Web API entirely — and a new playlist each shuffle would lose any manual download anyway.
 - **Writes aren't transactional.** The first write sets the playlist's contents and subsequent chunks append, ~20 requests for 2,000 tracks. A network failure mid-write can leave a partially populated playlist; running the shuffle again fixes it. The previous playlist is only deleted after the replacement is fully written, so a failure never leaves you with nothing.
+- **A reshuffle takes several seconds, and the music stops for all of them.** The whole chain is sequential: one request to check for new liked songs, one to create the playlist, ~20 to write 2,000 tracks (Spotify caps `/playlists/{id}/items` at 100 URIs per call), one to delete the old playlist, one to start playback. That's roughly 24 round trips — several seconds on Wi-Fi and noticeably worse on cellular — and playback is deliberately paused for the duration so the old order doesn't keep playing while the new one is being built. The outbound rate limiter is *not* a contributor here: each request already takes longer than the limiter's minimum spacing, so it never actually delays a sequential chain.
+- **Reshuffling while paused starts playback.** See [Reshuffle and playback](#reshuffle-and-playback) — Spotify cannot load a playlist context without playing it.
 - **Transient `503`s.** Spotify's API returns intermittent 5xx errors. The client retries on `429` but not on 5xx, so an unlucky run can fail outright. Retrying usually succeeds.
 - **Rate limiting can lock the app out for hours.** Spotify answers a `429` with a `Retry-After`, and when an app exceeds its rolling quota that value can be *hours* — 14+ has been observed in practice on a dev-mode app. Three defences: a circuit breaker halts all requests for 30s after the first `429` (continuing to probe is what escalates a throttle into a lockout), waits longer than 60s fail fast rather than sleeping (which is indistinguishable from a frozen app), and launch makes no network calls at all so a throttled account can't strand the UI on a loading spinner. Once locked out, nothing clears it but time.
 - **iOS only, so far.** An Android script exists (`npm run android`) but has not been tested.

@@ -208,13 +208,19 @@ extension SpotifyAppRemoteController: SPTAppRemoteDelegate {
   }
 
   func appRemote(_ appRemote: SPTAppRemote, didFailConnectionAttemptWithError error: Error?) {
+    // A connection we asked for and didn't get. The waiting promise decides
+    // whether this is worth showing — an auto-reconnect swallows it.
     onConnectionState?(["state": "disconnected", "error": error?.localizedDescription])
     pendingConnectPromise?.reject("ERR_CONNECTION_FAILED", error?.localizedDescription ?? "Connection failed.")
     pendingConnectPromise = nil
   }
 
   func appRemote(_ appRemote: SPTAppRemote, didDisconnectWithError error: Error?) {
-    onConnectionState?(["state": "disconnected", "error": error?.localizedDescription])
+    // Routine: Spotify drops the socket whenever it suspends, which happens on
+    // backgrounding and after a short idle with playback paused. Deliberately
+    // carries no `error` — surfacing it showed users "connection terminated"
+    // for something entirely expected.
+    onConnectionState?(["state": "disconnected"])
   }
 }
 

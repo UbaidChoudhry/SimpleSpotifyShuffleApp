@@ -7,7 +7,7 @@ import { clearTokens, isLoggedIn, login } from './src/auth';
 import { clearCurrentPlaylistId, loadCurrentPlaylistId } from './src/currentPlaylist';
 import { clearLikedSongsCache } from './src/likedSongsCache';
 import { NowPlayingScreen } from './src/NowPlayingScreen';
-import { shuffleLikedSongsIntoPlaylist, startPlaylistFromTop } from './src/spotifyApi';
+import { NoActiveDeviceError, shuffleLikedSongsIntoPlaylist, startPlaylistFromTop } from './src/spotifyApi';
 import { useSpotifyPlayer } from './src/spotifyPlayer';
 
 WebBrowser.maybeCompleteAuthSession();
@@ -47,24 +47,41 @@ export default function App() {
   }, []);
 
   const handleShuffle = async () => {
-    // Reshuffling while already playing must restart playback — Spotify is
-    // already holding a queue built from the old order, so without this the
-    // rewrite is silent and the feature reads as broken rather than working.
-    const wasPlaying = player.connection === 'connected' && player.snapshot?.isPaused === false;
+    // Playback must be repointed at the new playlist whenever Spotify is
+    // connected, not only when a track is actively playing. Spotify holds a
+    // queue built from the old order in both cases, so gating this on "was
+    // playing" meant a reshuffle from paused rewrote everything and then left
+    // the next tap on Play resuming the pre-shuffle playlist.
+    //
+    // Consequence: reshuffling while paused starts playback. Spotify offers no
+    // way to load a context without playing it, and the alternative — play then
+    // immediately pause — races two independent commands, with the losing
+    // branch leaving the phone playing and no pause on the way.
+    const isConnected = player.connection === 'connected';
     // Pause immediately, before the rewrite starts (which takes several
     // seconds) rather than only once it's done — the old track shouldn't
     // keep playing while the new order is being built. This also avoids a
     // real bug: Spotify ignores play() on a context it thinks is already
     // playing, so without pausing first, restarting afterward was a no-op.
-    if (wasPlaying) {
+    if (isConnected && player.snapshot?.isPaused === false) {
       await player.pause();
     }
     try {
       const result = await shuffleLikedSongsIntoPlaylist((message) => setStatus({ kind: 'busy', message }));
       setStatus({ kind: 'idle', playlistId: result.playlistId, trackCount: result.trackCount });
-      if (wasPlaying) {
+      if (isConnected) {
         await player.setShuffleOff();
-        await startPlaylistFromTop(result.playlistId);
+        try {
+          await startPlaylistFromTop(result.playlistId);
+        } catch (err) {
+          // Server-side playback needs a device Spotify still counts as active,
+          // and a session left paused for a few minutes stops being one — which
+          // is exactly the state this branch now has to serve. App Remote can
+          // wake the local app back up, so fall back to it rather than
+          // dead-ending on an error the user can't act on.
+          if (!(err instanceof NoActiveDeviceError)) throw err;
+          await player.playPlaylist(result.playlistId);
+        }
       }
     } catch (err) {
       setStatus({ kind: 'error', message: err instanceof Error ? err.message : 'Shuffle failed.' });

@@ -23,9 +23,11 @@ public class ExpoSpotifyAppRemoteModule: Module {
       SpotifyAppRemoteController.shared.disconnect()
     }
 
-    OnAppEntersBackground {
-      SpotifyAppRemoteController.shared.disconnect()
-    }
+    // Deliberately no OnAppEntersBackground disconnect. Tearing the connection
+    // down on every app switch meant a two-second trip to another app dropped
+    // the player and surfaced a "connection terminated" error. Spotify closes
+    // the socket on its own when it suspends; the JS side treats that as
+    // routine and reconnects on foreground.
 
     Function("configure") { (clientId: String, redirectUri: String) in
       SpotifyAppRemoteController.shared.configure(clientId: clientId, redirectUri: redirectUri)

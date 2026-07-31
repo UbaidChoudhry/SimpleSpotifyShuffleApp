@@ -89,6 +89,9 @@ export function useSpotifyPlayer(): SpotifyPlayer {
   const configuredRef = useRef(false);
   const trackUriRef = useRef<string | null>(null);
   const isTrackSavedRef = useRef(false);
+  // Gates the silent foreground reconnect — only worth attempting if a
+  // connection existed at some point this session.
+  const hasEverConnectedRef = useRef(false);
   // Keyed by track URI so revisiting a track (replay, skip-back) doesn't
   // re-fetch art already pulled this session.
   const albumArtCacheRef = useRef<Map<string, string>>(new Map());
@@ -142,16 +145,41 @@ export function useSpotifyPlayer(): SpotifyPlayer {
     const connectionSub = SpotifyAppRemote.addListener('onConnectionStateChange', (event) => {
       connectionRef.current = event.state;
       setConnection(event.state);
-      if (event.error) setPlayerError(event.error);
+      if (event.state === 'connected') {
+        hasEverConnectedRef.current = true;
+        setPlayerError(null);
+      }
+      // Connection errors are deliberately not surfaced here. Spotify drops the
+      // socket routinely — on backgrounding, and after a short idle with
+      // playback paused — and showing that as a failure meant a two-second app
+      // switch produced "connection terminated". Failures that matter are the
+      // ones a user action was waiting on, and those reject playPlaylist's
+      // promise instead.
+      if (event.error) console.log('[spotify] app remote connection error:', event.error);
     });
     const tokenSub = SpotifyAppRemote.addListener('onAccessToken', (event) => {
       SecureStore.setItemAsync(APP_REMOTE_TOKEN_KEY, event.accessToken);
     });
 
     const appStateSub = AppState.addEventListener('change', (state) => {
-      if (state !== 'active' || connectionRef.current !== 'connected') return;
-      SpotifyAppRemote.getPlayerState().then((fresh) => {
-        if (fresh) applyPlayerState(fresh);
+      if (state !== 'active') return;
+
+      if (connectionRef.current === 'connected') {
+        // Position drifts while backgrounded — playback continues in Spotify.
+        SpotifyAppRemote.getPlayerState().then((fresh) => {
+          if (fresh) applyPlayerState(fresh);
+        });
+        return;
+      }
+
+      // Silently restore a connection Spotify dropped while we were away, so
+      // returning to the app doesn't demand a fresh tap on Play. Only attempted
+      // if there was a connection to begin with; failure is expected whenever
+      // Spotify is fully suspended, and just leaves the Play button showing.
+      if (!hasEverConnectedRef.current) return;
+      loadToken().then((token) => {
+        if (!token) return;
+        SpotifyAppRemote.connectWithAccessToken(token).catch(() => {});
       });
     });
 
@@ -162,7 +190,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
       appStateSub.remove();
       SpotifyAppRemote.disconnect().catch(() => {});
     };
-  }, [applyPlayerState, ensureConfigured]);
+  }, [applyPlayerState, ensureConfigured, loadToken]);
 
   // The SDK only pushes position on discrete state changes, so the bar
   // interpolates between pushes rather than sitting still until the next one.
@@ -273,6 +301,8 @@ export function useSpotifyPlayer(): SpotifyPlayer {
   const disconnect = useCallback(async () => {
     await SpotifyAppRemote.disconnect().catch(() => {});
     connectionRef.current = 'disconnected';
+    // Logging out is the one disconnect that should NOT auto-reconnect.
+    hasEverConnectedRef.current = false;
     setConnection('disconnected');
     setSnapshot(null);
     trackUriRef.current = null;

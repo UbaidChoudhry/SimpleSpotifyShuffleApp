@@ -297,6 +297,14 @@ export async function shuffleLikedSongsIntoPlaylist(
 }
 
 /**
+ * Spotify has no device it currently considers active, so it will not accept a
+ * playback command. Kept distinct from other playback failures because this one
+ * is recoverable — App Remote can wake the local Spotify app back up, whereas a
+ * missing scope or a rate limit cannot be worked around here.
+ */
+export class NoActiveDeviceError extends Error {}
+
+/**
  * Starts the playlist from its first track using Spotify's server-side
  * playback control rather than App Remote.
  *
@@ -327,7 +335,7 @@ export async function startPlaylistFromTop(playlistId: string): Promise<void> {
       );
     }
     if (message.includes('404')) {
-      throw new Error('No active Spotify device found. Start playback again, then reshuffle.');
+      throw new NoActiveDeviceError('No active Spotify device found. Start playback again, then reshuffle.');
     }
     throw err;
   }

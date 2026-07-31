@@ -12,6 +12,27 @@
   see the playlist cache rule below.)
 - Shuffle must be Fisher-Yates with a seeded RNG. Reject sort(by: { Bool.random() }).
 
+## Reshuffle must repoint playback on CONNECTED, not on "was playing"
+Every shuffle lands in a new playlist, so Spotify keeps serving a queue built
+from the old order until something explicitly repoints it. `handleShuffle` in
+`App.tsx` therefore gates the restart on `player.connection === 'connected'`.
+
+Gating on `snapshot?.isPaused === false` is the obvious-looking shortcut and it
+is a real bug that shipped: reshuffling while paused rewrote everything, deleted
+the old playlist, and then left the next tap on Play resuming the pre-shuffle
+order from a playlist that no longer existed.
+
+- Reshuffling while paused therefore STARTS playback. That is intended.
+- Do NOT "preserve" the paused state with play-then-immediately-pause. The two
+  commands are independent and race; awaiting the play only confirms Spotify's
+  server accepted it, not that the device acted on it. When the pause loses, it
+  is discarded against a device that hadn't started yet and the phone plays with
+  no pause coming.
+- `startPlaylistFromTop` needs a device Spotify still counts as active, and a
+  session left paused for minutes is not one. That 404 is thrown as
+  `NoActiveDeviceError` and falls back to App Remote, which can wake Spotify.
+  Keep that fallback narrow — every other playback failure must propagate.
+
 ## Spotify client playlist cache — do NOT reuse a playlist URI
 The Spotify iOS app caches playlist contents keyed by URI and there is NO API to
 invalidate it. Rewriting the same playlist updates Spotify's servers, but the
