@@ -1,6 +1,6 @@
-import { ActionSheetIOS, ActivityIndicator, Image, Linking, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActionSheetIOS, ActivityIndicator, Linking, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
+import { AlbumArt } from './AlbumArt';
 import {
   ChevronUpIcon,
   EllipsisIcon,
@@ -11,7 +11,6 @@ import {
   PrevIcon,
   RepeatIcon,
   ReshuffleIcon,
-  VinylIcon,
 } from './icons';
 import { ProgressBar } from './ProgressBar';
 import type { SpotifyPlayer } from './spotifyPlayer';
@@ -45,6 +44,7 @@ export function NowPlayingScreen({
   playlistId,
   trackCount,
   notice,
+  onPlay,
   onReshuffle,
   onClearCache,
   onLogOut,
@@ -53,6 +53,7 @@ export function NowPlayingScreen({
   playlistId: string;
   trackCount: number | null;
   notice: string | null;
+  onPlay: () => void;
   onReshuffle: () => void;
   onClearCache: () => void;
   onLogOut: () => void;
@@ -92,7 +93,7 @@ export function NowPlayingScreen({
           {notice != null && <Text style={styles.notice}>{notice}</Text>}
           <TouchableOpacity
             style={styles.bigPlayButton}
-            onPress={() => player.playPlaylist(playlistId)}
+            onPress={onPlay}
             disabled={player.connection === 'connecting'}
           >
             {player.connection === 'connecting' ? (
@@ -116,18 +117,13 @@ export function NowPlayingScreen({
       <Header onOpenMenu={openMenu} />
 
       <View style={styles.artWrap}>
-        {player.albumArtUri != null ? (
-          <Image source={{ uri: player.albumArtUri }} style={styles.art} />
-        ) : (
-          <LinearGradient
-            colors={[gradientTop, gradientBottom]}
-            start={{ x: 0.3, y: 0 }}
-            end={{ x: 0.7, y: 1 }}
-            style={styles.art}
-          >
-            <VinylIcon size={26} color={colors.vinylIcon} />
-          </LinearGradient>
-        )}
+        <AlbumArt
+          uri={player.albumArtUri}
+          gradientTop={gradientTop}
+          gradientBottom={gradientBottom}
+          onSwipeNext={player.skipNext}
+          onSwipePrevious={player.skipPrevious}
+        />
       </View>
 
       <View style={styles.footer}>
@@ -217,19 +213,11 @@ const styles = StyleSheet.create({
   },
   secondaryButton: { marginTop: 4, paddingVertical: 10 },
   secondaryButtonText: { color: colors.nearWhite, fontSize: 15, fontWeight: '600' },
-  artWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', marginTop: 18 },
-  art: {
-    width: 260,
-    height: 260,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.45,
-    shadowRadius: 60,
-    shadowOffset: { width: 0, height: 24 },
-    elevation: 12,
-  },
+  // The negative inset cancels the screen's horizontal padding so the art's
+  // swipe target reaches the edges of the display — a thumb swipe that starts
+  // in the margin beside the artwork should still skip the track. Centring
+  // moves into AlbumArt, which now owns this whole band.
+  artWrap: { flex: 1, marginTop: 18, marginHorizontal: -26 },
   footer: { marginTop: 22 },
   titleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 16 },
   titleTextBlock: { minWidth: 0, flex: 1 },

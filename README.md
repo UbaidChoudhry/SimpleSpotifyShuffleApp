@@ -152,6 +152,23 @@ The SDK itself is vendored via CocoaPods' `apple.extraPods` mechanism, fetched d
 
 The app also calls `setShuffle(false)` on every connect — enforcing the "play with shuffle off" rule above programmatically rather than only documenting it.
 
+Alongside the transport buttons, the album art is **swipeable**: drag it left to skip forward, right to go back. The art trails the finger at damped speed and springs back on release rather than animating out with the swipe — the replacement artwork is fetched asynchronously after the track actually changes, so a hand-off animation would be sliding in the *old* image. The gesture only claims a touch once it is clearly horizontal, leaving taps and vertical drags alone.
+
+### Resuming where you left off
+
+Opening the app and hitting Play picks up at the track and offset playback had reached, instead of restarting the playlist.
+
+This has to be done in two steps. `authorizeAndPlayURI` is the only thing that can wake a suspended Spotify — the Web API has no active device to command at that point — and it takes a context URI with **no offset parameter**, so it always starts at track 1. The remembered offset is therefore reapplied once App Remote reports `connected`, via `PUT /me/player/play` against the session that just came up ([`resumePlaylistAt`](src/spotifyApi.ts), driven by `startPlayback` in [`App.tsx`](App.tsx)).
+
+The position lives in `playback-position.json` next to the library cache, written on every player-state push *and* on backgrounding — the pushes are discrete events, so without the background write the saved offset would be stale by however long playback ran after the last one. Launch still reads nothing but local files.
+
+Two rules keep it from doing more harm than good:
+
+- **The track is addressed by URI, never by index.** An index would mean persisting the playlist's order too, and a stale index resumes into the wrong song rather than failing visibly.
+- **A Spotify session this app didn't just wake is authoritative.** If Spotify was still running, it never lost the user's place, while the saved position is only as fresh as the last state push before this app stopped running — so overriding it would *rewind* playback. `player.lastConnectionOrigin()` distinguishes "we woke it" from "it was already there". The saved position still wins when Spotify has since moved on to some other album or playlist.
+
+Only playlist contexts are recorded, so a detour through an album or a radio session in the Spotify app can't overwrite your place in the shuffle. And because every shuffle lands in a new playlist, a position saved against a previous one is discarded rather than applied.
+
 ### Why a new playlist each time
 
 Each shuffle writes into a **freshly created** playlist and deletes the previous one, rather than rewriting a single stable playlist. This looks wasteful and isn't — it's the only thing that makes reshuffling actually work.
@@ -198,8 +215,10 @@ src/likedSongsSync.ts                Delta-sync algorithm (pure, no I/O)
 src/likedSongsCache.ts               Cache persistence
 src/shuffle.ts                       Seeded Fisher-Yates
 src/currentPlaylist.ts               Remembers the current playlist ID (local file)
+src/playbackPosition.ts              Remembers the last track and offset (local file)
 src/spotifyPlayer.ts                 In-app player hook (progress interpolation, lifecycle)
 src/NowPlayingScreen.tsx             In-app player UI
+src/AlbumArt.tsx                     Album art with swipe-to-skip
 src/ProgressBar.tsx                  Seekable progress bar
 src/icons.tsx                        SVG icons
 src/theme.ts                         Colours, per-track accent derivation

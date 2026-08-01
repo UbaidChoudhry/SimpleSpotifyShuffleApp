@@ -8,6 +8,7 @@ import {
 } from './config';
 import { loadLikedSongsCache, saveLikedSongsCache } from './likedSongsCache';
 import { fullSync, LIKED_SONGS_PAGE_SIZE, SavedTracksPage, tryIncrementalSync } from './likedSongsSync';
+import type { PlaybackPosition } from './playbackPosition';
 import { randomSeed, seededShuffle } from './shuffle';
 
 const API_BASE = 'https://api.spotify.com/v1';
@@ -305,26 +306,31 @@ export async function shuffleLikedSongsIntoPlaylist(
 export class NoActiveDeviceError extends Error {}
 
 /**
- * Starts the playlist from its first track using Spotify's server-side
- * playback control rather than App Remote.
+ * Points Spotify's server-side playback at a playlist, rather than going
+ * through App Remote.
  *
- * This deliberately does NOT go through the local Spotify app: that app caches
+ * App Remote is deliberately avoided here: the local Spotify app caches
  * playlist contents and keeps serving the pre-reshuffle order until it's
- * manually refreshed, so every App Remote play variant (context URI, bare
- * track URI, fetched content item with an explicit index) replayed the old
- * list. Going through the server makes Spotify resolve the playlist fresh.
+ * manually refreshed, so every App Remote play variant (context URI, bare track
+ * URI, fetched content item with an explicit index) replayed the old list.
+ * Going through the server makes Spotify resolve the playlist fresh.
  *
- * Note this is only used to restart an already-connected, already-playing
- * session — cold start still goes through SPTAppRemote.authorizeAndPlayURI.
+ * Only usable against a session Spotify already counts as active — cold start
+ * has no device to command and must go through SPTAppRemote.authorizeAndPlayURI
+ * first.
  */
-export async function startPlaylistFromTop(playlistId: string): Promise<void> {
+async function requestPlaylistPlayback(
+  playlistId: string,
+  offset: { position: number } | { uri: string },
+  positionMs: number
+): Promise<void> {
   try {
     await spotifyFetch('/me/player/play', {
       method: 'PUT',
       body: JSON.stringify({
         context_uri: `spotify:playlist:${playlistId}`,
-        offset: { position: 0 },
-        position_ms: 0,
+        offset,
+        position_ms: positionMs,
       }),
     });
   } catch (err) {
@@ -335,8 +341,28 @@ export async function startPlaylistFromTop(playlistId: string): Promise<void> {
       );
     }
     if (message.includes('404')) {
-      throw new NoActiveDeviceError('No active Spotify device found. Start playback again, then reshuffle.');
+      throw new NoActiveDeviceError('No active Spotify device found. Start playback in Spotify, then try again.');
     }
     throw err;
   }
+}
+
+/** Restarts a reshuffled playlist from its first track. */
+export async function startPlaylistFromTop(playlistId: string): Promise<void> {
+  await requestPlaylistPlayback(playlistId, { position: 0 }, 0);
+}
+
+/**
+ * Picks playback back up at a remembered track and offset.
+ *
+ * Addressing the track by URI rather than by index is what makes this safe to
+ * persist across launches: the app never has to hold a copy of the playlist's
+ * order, and a stale index can't silently resume into the wrong song.
+ */
+export async function resumePlaylistAt(position: PlaybackPosition): Promise<void> {
+  await requestPlaylistPlayback(
+    position.playlistId,
+    { uri: position.trackUri },
+    Math.max(0, Math.round(position.positionMs))
+  );
 }

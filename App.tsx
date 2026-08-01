@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -7,12 +7,22 @@ import { clearTokens, isLoggedIn, login } from './src/auth';
 import { clearCurrentPlaylistId, loadCurrentPlaylistId } from './src/currentPlaylist';
 import { clearLikedSongsCache } from './src/likedSongsCache';
 import { NowPlayingScreen } from './src/NowPlayingScreen';
-import { NoActiveDeviceError, shuffleLikedSongsIntoPlaylist, startPlaylistFromTop } from './src/spotifyApi';
+import { clearPlaybackPosition, loadPlaybackPosition, PlaybackPosition } from './src/playbackPosition';
+import {
+  NoActiveDeviceError,
+  resumePlaylistAt,
+  shuffleLikedSongsIntoPlaylist,
+  startPlaylistFromTop,
+} from './src/spotifyApi';
 import { useSpotifyPlayer } from './src/spotifyPlayer';
 
 WebBrowser.maybeCompleteAuthSession();
 
 const CACHE_CLEARED_NOTICE = 'Cached library cleared. The next shuffle will do a full resync.';
+
+// Spotify keeps its own position when it stays alive between sessions, so a
+// remembered offset this close to where it already is isn't worth a seek.
+const POSITION_DRIFT_TOLERANCE_MS = 3000;
 
 type Status =
   | { kind: 'checking' }
@@ -24,6 +34,10 @@ type Status =
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'checking' });
   const player = useSpotifyPlayer();
+  // A tap on Play that had to wake Spotify first. App Remote's connection lands
+  // asynchronously, well after playPlaylist resolves, so the work that needs a
+  // live connection is deferred to the effect below.
+  const pendingPlayRef = useRef<{ playlistId: string; position: PlaybackPosition | null } | null>(null);
 
   useEffect(() => {
     isLoggedIn()
@@ -45,6 +59,95 @@ export default function App() {
         setStatus({ kind: 'idle', playlistId: null, trackCount: null });
       });
   }, []);
+
+  /**
+   * Gets music going, picking up from `remembered` where that's still the best
+   * information available.
+   *
+   * Only ever called with a live App Remote connection, which is what makes the
+   * server-side resume legal here — it needs a device Spotify counts as active,
+   * and waking Spotify is App Remote's job (see handlePlay).
+   */
+  const startPlayback = async (
+    playlistId: string,
+    remembered: PlaybackPosition | null,
+    spotifyWasWoken: boolean
+  ) => {
+    const contextUri = `spotify:playlist:${playlistId}`;
+    const state = await player.readState();
+    const onPlaylist = state != null && state.contextUri === contextUri;
+
+    // A session already on this playlist that this app didn't just start
+    // outranks anything remembered: Spotify never lost the user's place, while
+    // the saved position is only as fresh as the last state push before this
+    // app stopped running. The remembered position is for the case Spotify
+    // can't cover — it was asleep, or it has since moved on to something else.
+    const target = remembered != null && (spotifyWasWoken || !onPlaylist) ? remembered : null;
+
+    if (target != null && !(onPlaylist && state?.track?.uri === target.trackUri)) {
+      try {
+        await resumePlaylistAt(target);
+        return;
+      } catch (err) {
+        // Spotify only takes playback commands while it has an active device,
+        // and a session left paused for a while stops being one. Losing the
+        // resume point is a much smaller failure than refusing to play at all,
+        // so fall through to a plain start rather than dead-ending here.
+        if (!(err instanceof NoActiveDeviceError)) throw err;
+      }
+    }
+
+    if (state == null || !onPlaylist) {
+      await player.playPlaylist(playlistId);
+      return;
+    }
+
+    // Already sitting on the right track, so nothing needs repointing — it only
+    // has to start moving again.
+    if (target != null && Math.abs(state.positionMs - target.positionMs) > POSITION_DRIFT_TOLERANCE_MS) {
+      await player.seekTo(target.positionMs);
+    }
+    if (state.isPaused) await player.resume();
+  };
+
+  const handlePlay = async (playlistId: string) => {
+    const remembered = await loadPlaybackPosition();
+    // Every shuffle lands in a new playlist, so a position saved against a
+    // different one has nothing left to point at.
+    const position = remembered?.playlistId === playlistId ? remembered : null;
+
+    if (player.connection === 'connected') {
+      await startPlayback(playlistId, position, false);
+      return;
+    }
+
+    // Cold start. Waking Spotify has to go through App Remote — there is no
+    // active device for a server-side command to reach yet — and that always
+    // begins the playlist at its first track, with no offset to pass. The
+    // remembered position is reapplied once the connection lands.
+    pendingPlayRef.current = { playlistId, position };
+    try {
+      await player.playPlaylist(playlistId);
+    } catch (err) {
+      pendingPlayRef.current = null;
+      console.log('[spotify] could not start playback:', err instanceof Error ? err.message : err);
+    }
+  };
+
+  useEffect(() => {
+    if (player.connection !== 'connected') return;
+    const pending = pendingPlayRef.current;
+    if (pending == null) return;
+    pendingPlayRef.current = null;
+    startPlayback(pending.playlistId, pending.position, player.lastConnectionOrigin() === 'wokeSpotify').catch(
+      (err) => {
+        // Deliberately not surfaced as an error state: that would tear down the
+        // now-playing screen over a failure whose worst outcome is playing from
+        // the top of the playlist, which is where Spotify already is.
+        console.log('[spotify] could not resume where playback left off:', err instanceof Error ? err.message : err);
+      }
+    );
+  }, [player.connection]);
 
   const handleShuffle = async () => {
     // Playback must be repointed at the new playlist whenever Spotify is
@@ -68,6 +171,9 @@ export default function App() {
     }
     try {
       const result = await shuffleLikedSongsIntoPlaylist((message) => setStatus({ kind: 'busy', message }));
+      // The old playlist is gone and the new one starts at its top, so anything
+      // remembered about the previous one is now stale.
+      await clearPlaybackPosition();
       setStatus({ kind: 'idle', playlistId: result.playlistId, trackCount: result.trackCount });
       if (isConnected) {
         await player.setShuffleOff();
@@ -113,19 +219,24 @@ export default function App() {
     await player.disconnect();
     // Otherwise the next account inherits a pointer to a playlist it doesn't own.
     await clearCurrentPlaylistId();
+    await clearPlaybackPosition();
     await clearTokens();
     setStatus({ kind: 'loggedOut' });
   };
 
+  // Held in a local const so the narrowing below survives into onPlay's closure.
+  const idlePlaylistId = status.kind === 'idle' ? status.playlistId : null;
+
   return (
     <SafeAreaProvider>
       <StatusBar style="light" />
-      {status.kind === 'idle' && status.playlistId != null ? (
+      {status.kind === 'idle' && idlePlaylistId != null ? (
         <NowPlayingScreen
           player={player}
-          playlistId={status.playlistId}
+          playlistId={idlePlaylistId}
           trackCount={status.trackCount}
           notice={status.notice ?? null}
+          onPlay={() => void handlePlay(idlePlaylistId)}
           onReshuffle={handleShuffle}
           onClearCache={handleClearCache}
           onLogOut={handleLogOut}
