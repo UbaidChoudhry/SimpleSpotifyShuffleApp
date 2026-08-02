@@ -33,26 +33,43 @@ order from a playlist that no longer existed.
   `NoActiveDeviceError` and falls back to App Remote, which can wake Spotify.
   Keep that fallback narrow — every other playback failure must propagate.
 
-## Resume-where-you-left-off is reapplied AFTER the connection, not on cold start
-`authorizeAndPlayURI` is still the only way to wake a suspended Spotify, and it
-takes a context URI with no offset — it always starts at track 1. So the offset
-is reapplied once App Remote reports `connected`, from a position persisted
-locally in `src/playbackPosition.ts` (`handlePlay` / `startPlayback` in
-`App.tsx`). Do NOT "simplify" this into a `PUT /me/player/play` on the Play tap
-itself: with Spotify asleep there is no active device and it 404s.
+## Play adopts Spotify's current playback — it must NOT switch the song
+The Play button on launch resumes whatever the Spotify app already has loaded —
+playing or paused, this app's playlist or an unrelated album — because that is
+the user's actual place. The shuffle playlist is only started, from the top,
+when Spotify has nothing loaded at all (`handlePlay` / `startPlayback` in
+`App.tsx`). Do NOT reintroduce a repoint-to-our-playlist on this path; the whole
+point is that Play is non-destructive to a session already in progress.
 
-- The remembered track is addressed by URI, never by index. An index would mean
-  persisting the playlist's order, and a stale one resumes into the wrong song.
-- A Spotify session this app did NOT just wake is authoritative — it never lost
-  the user's place, while the saved position is only as fresh as the last state
-  push before the app stopped running. `player.lastConnectionOrigin()` is what
-  distinguishes the two; overriding a live session rewinds playback.
-  The saved position still wins when Spotify has moved on to another context.
-- Only playlist contexts are persisted, so a detour through an album or a radio
-  session in Spotify can't overwrite the place in the shuffle.
-- Position is written on every player-state push AND on backgrounding. The
-  pushes are discrete events, so without the background write the saved offset
-  is stale by however long playback ran after the last one.
+- "Nothing playing" is `readState()` reporting no track. A paused track IS
+  something playing — resume it, don't replace it.
+- **Wake Spotify with a BLANK URI** (`player.connectOrWake`). `authorizeAndPlayURI`
+  is still the only way to wake a suspended Spotify, and whatever URI it gets is
+  what starts playing — so passing the playlist URI on the Play tap made a cold
+  start switch the song EVERY time. `SPTAppRemote.h` documents the empty string
+  as "attempt to play the user's last song", which is the whole feature. (Same
+  header: "The passed URI will start playing unless Spotify is already playing"
+  — which is why the bug looked intermittent.) `playPlaylist` still passes a
+  real URI; its callers, unlike Play, mean to change what's playing.
+- A just-woken Spotify reports an empty player for a moment while playback comes
+  back up, and `readState()` returns null on a failed read too. Neither is proof
+  of "nothing playing", so `startPlayback` retries before falling back to the
+  playlist (`justWoken`, from `lastConnectionOrigin()`). Acting on the first
+  empty reading starts the playlist over the song being resumed — the exact
+  hijack this is all here to prevent.
+- Reading state needs a live App Remote connection, so a cold start decides
+  nothing up front: attach or wake first, read second, and only then choose.
+- Connect with the PKCE token from `getValidAccessToken()`, NOT the one the SDK
+  hands back (`src/appRemoteToken.ts`, kept only as an offline fallback). The
+  SDK's token can't be refreshed and dies within the hour; once it's stale the
+  connect fails, the wake fallback runs, and Play starts switching songs again
+  — the exact bug this behaviour exists to avoid. The PKCE login already
+  requests `app-remote-control`, so its token is valid for App Remote.
+- Do NOT "simplify" the Play tap into a `PUT /me/player/play`: with Spotify
+  asleep there is no active device and it 404s.
+- Nothing about playback position is persisted locally any more (there is no
+  `src/playbackPosition.ts`). Spotify itself is the source of truth for where
+  the user was, and a saved offset can only ever be staler than that.
 
 ## Spotify client playlist cache — do NOT reuse a playlist URI
 The Spotify iOS app caches playlist contents keyed by URI and there is NO API to

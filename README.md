@@ -154,20 +154,20 @@ The app also calls `setShuffle(false)` on every connect — enforcing the "play 
 
 Alongside the transport buttons, the album art is **swipeable**: drag it left to skip forward, right to go back. The art trails the finger at damped speed and springs back on release rather than animating out with the swipe — the replacement artwork is fetched asynchronously after the track actually changes, so a hand-off animation would be sliding in the *old* image. The gesture only claims a touch once it is clearly horizontal, leaving taps and vertical drags alone.
 
-### Resuming where you left off
+### Play picks up whatever Spotify is already on
 
-Opening the app and hitting Play picks up at the track and offset playback had reached, instead of restarting the playlist.
+Opening the app and hitting Play resumes what the Spotify app currently has loaded — the same track, at the same offset, in whatever context it belongs to — rather than switching you to the shuffle playlist. A paused track counts: it gets resumed, not replaced. Only when Spotify has nothing loaded at all does Play open the shuffle playlist and start it from the top.
 
-This has to be done in two steps. `authorizeAndPlayURI` is the only thing that can wake a suspended Spotify — the Web API has no active device to command at that point — and it takes a context URI with **no offset parameter**, so it always starts at track 1. The remembered offset is therefore reapplied once App Remote reports `connected`, via `PUT /me/player/play` against the session that just came up ([`resumePlaylistAt`](src/spotifyApi.ts), driven by `startPlayback` in [`App.tsx`](App.tsx)).
+The app never has to remember any of this, because Spotify already knows it. The whole decision is one `getPlayerState()` read (`startPlayback` in [`App.tsx`](App.tsx)) followed by either a resume or a plain play.
 
-The position lives in `playback-position.json` next to the library cache, written on every player-state push *and* on backgrounding — the pushes are discrete events, so without the background write the saved offset would be stale by however long playback ran after the last one. Launch still reads nothing but local files.
+The catch is that the read needs a live App Remote connection, and on a cold start there isn't one — so nothing can be decided up front. `playPlaylist` resolves that in the order that matters:
 
-Two rules keep it from doing more harm than good:
+1. **Attach without playing.** `connectWithAccessToken` against a Spotify that's still running connects without touching playback at all. Once `connected` lands, the state read above runs and picks up whatever was there. It connects with the *PKCE* access token rather than the one the App Remote SDK hands back: the SDK's token can't be refreshed and is dead within the hour, and a failed connect drops through to step 2, which is precisely the song-switching this feature exists to prevent. The login already asks for `app-remote-control`, so the refreshable token is valid here; the SDK's own is kept in [`src/appRemoteToken.ts`](src/appRemoteToken.ts) as an offline fallback.
+2. **Wake it with a blank URI.** If there's no session to attach to, `authorizeAndPlayURI` — the only thing that can wake a suspended Spotify, since the Web API has no active device to command at that point — launches it. Whatever URI it's handed is what starts playing, so it gets an **empty string**, which the SDK documents as *"attempt to play the user's last song"*. Spotify comes back on what the user was listening to, not on a playlist of ours. Handing it the playlist URI instead is the obvious-looking version and it's wrong: it switches the song on every cold start.
 
-- **The track is addressed by URI, never by index.** An index would mean persisting the playlist's order too, and a stale index resumes into the wrong song rather than failing visibly.
-- **A Spotify session this app didn't just wake is authoritative.** If Spotify was still running, it never lost the user's place, while the saved position is only as fresh as the last state push before this app stopped running — so overriding it would *rewind* playback. `player.lastConnectionOrigin()` distinguishes "we woke it" from "it was already there". The saved position still wins when Spotify has since moved on to some other album or playlist.
+A woken Spotify then reports an empty player for a moment while playback spins up, and a failed state read is also indistinguishable from an empty one — so `startPlayback` retries for a couple of seconds before concluding there's nothing to resume (`player.lastConnectionOrigin()` says whether that patience is needed). Believing the first empty reading starts the playlist right over the song being resumed, which is the whole failure this feature exists to avoid.
 
-Only playlist contexts are recorded, so a detour through an album or a radio session in the Spotify app can't overwrite your place in the shuffle. And because every shuffle lands in a new playlist, a position saved against a previous one is discarded rather than applied.
+Launch itself still reads nothing but local files — the connection only happens on a tap on Play.
 
 ### Why a new playlist each time
 
@@ -210,12 +210,12 @@ The cache is versioned and validated on read. Anything corrupt or unrecognized i
 App.tsx                              UI and state machine
 src/config.ts                        Client ID, redirect URIs, scopes, playlist name
 src/auth.ts                          PKCE login, token refresh, Keychain storage
+src/appRemoteToken.ts                Fallback App Remote token from the SDK (Keychain)
 src/spotifyApi.ts                    Spotify HTTP calls and sync orchestration
 src/likedSongsSync.ts                Delta-sync algorithm (pure, no I/O)
 src/likedSongsCache.ts               Cache persistence
 src/shuffle.ts                       Seeded Fisher-Yates
 src/currentPlaylist.ts               Remembers the current playlist ID (local file)
-src/playbackPosition.ts              Remembers the last track and offset (local file)
 src/spotifyPlayer.ts                 In-app player hook (progress interpolation, lifecycle)
 src/NowPlayingScreen.tsx             In-app player UI
 src/AlbumArt.tsx                     Album art with swipe-to-skip

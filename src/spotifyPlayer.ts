@@ -1,16 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
-import * as SecureStore from 'expo-secure-store';
 import SpotifyAppRemote from '../modules/spotify-app-remote';
 import type { NativePlayerState, RepeatMode } from '../modules/spotify-app-remote';
+import { loadAppRemoteToken, saveAppRemoteToken } from './appRemoteToken';
+import { getValidAccessToken } from './auth';
 import { APP_REMOTE_REDIRECT_URI, assertClientIdConfigured, SPOTIFY_CLIENT_ID } from './config';
-import { savePlaybackPosition } from './playbackPosition';
 
-const APP_REMOTE_TOKEN_KEY = 'spotify_app_remote_token';
 const SPOTIFY_NOT_INSTALLED = 'The Spotify app is required to play music here.';
 // Spotify snaps this to its own available sizes; this just requests "large."
 const ALBUM_ART_SIZE = 640;
-const PLAYLIST_URI_PREFIX = 'spotify:playlist:';
 
 // off -> context (repeat the whole playlist) -> track (repeat one song) -> off,
 // matching Spotify's own client's cycle order.
@@ -19,10 +17,6 @@ const NEXT_REPEAT_MODE: Record<RepeatMode, RepeatMode> = {
   context: 'track',
   track: 'off',
 };
-
-export async function clearAppRemoteToken(): Promise<void> {
-  await SecureStore.deleteItemAsync(APP_REMOTE_TOKEN_KEY);
-}
 
 export type PlayerTrack = {
   uri: string;
@@ -49,10 +43,10 @@ export type PlayerReading = PlayerSnapshot & { positionMs: number };
  * How the current connection came about.
  *
  * `resumedSession` means Spotify was already running and kept whatever it was
- * doing; `wokeSpotify` means it was launched by `authorizeAndPlayURI`, which
- * always starts the given playlist at its first track. Only the second case
- * leaves the player somewhere this app chose rather than somewhere the user
- * left it, which is what tells a resume whether it has anything to correct.
+ * doing, so its state is readable immediately. `wokeSpotify` means it was
+ * launched by `authorizeAndPlayURI` and is still starting playback, so its
+ * first reported state may be empty for a moment — a reader that treats that
+ * as "nothing to play" will act on a state Spotify hasn't finished producing.
  */
 export type ConnectionOrigin = 'resumedSession' | 'wokeSpotify';
 
@@ -66,6 +60,7 @@ export type SpotifyPlayer = {
   isTrackSaved: boolean;
   albumArtUri: string | null;
   playPlaylist: (playlistId: string) => Promise<void>;
+  connectOrWake: () => Promise<void>;
   lastConnectionOrigin: () => ConnectionOrigin | null;
   setShuffleOff: () => Promise<void>;
   togglePlayPause: () => Promise<void>;
@@ -89,11 +84,6 @@ function toPlayerSnapshot(state: NativePlayerState): PlayerSnapshot {
   };
 }
 
-export function playlistIdFromContextUri(contextUri: string | null): string | null {
-  if (contextUri == null || !contextUri.startsWith(PLAYLIST_URI_PREFIX)) return null;
-  return contextUri.slice(PLAYLIST_URI_PREFIX.length) || null;
-}
-
 export function useSpotifyPlayer(): SpotifyPlayer {
   const [connection, setConnection] = useState<PlayerConnection>('disconnected');
   const [snapshot, setSnapshot] = useState<PlayerSnapshot | null>(null);
@@ -113,8 +103,6 @@ export function useSpotifyPlayer(): SpotifyPlayer {
   const configuredRef = useRef(false);
   const trackUriRef = useRef<string | null>(null);
   const isTrackSavedRef = useRef(false);
-  const contextUriRef = useRef<string | null>(null);
-  const isPausedRef = useRef(true);
   const connectionOriginRef = useRef<ConnectionOrigin | null>(null);
   // Gates the silent foreground reconnect — only worth attempting if a
   // connection existed at some point this session.
@@ -130,25 +118,71 @@ export function useSpotifyPlayer(): SpotifyPlayer {
     configuredRef.current = true;
   }, []);
 
-  const loadToken = useCallback(() => SecureStore.getItemAsync(APP_REMOTE_TOKEN_KEY), []);
-
-  /** Where playback is right now, interpolated the same way the progress bar is. */
-  const livePositionMs = useCallback(() => {
-    const { positionMs: base, at } = positionBaseRef.current;
-    const elapsed = isPausedRef.current ? 0 : (Date.now() - at) * playbackSpeedRef.current;
-    return Math.max(0, Math.round(Math.min(base + elapsed, durationMsRef.current)));
+  /**
+   * Every token worth trying to attach with, freshest first.
+   *
+   * The PKCE login already requests `app-remote-control` (see SCOPES) and App
+   * Remote accepts any token carrying it, so the Web API's token works here —
+   * and unlike the one the SDK hands back, it refreshes itself. The SDK's own
+   * token can't be refreshed and dies within the hour, but it's kept as a
+   * second attempt: it's the one Spotify itself issued, and it still works when
+   * a refresh can't be reached at all.
+   */
+  const connectTokens = useCallback(async (): Promise<string[]> => {
+    const tokens: string[] = [];
+    try {
+      tokens.push(await getValidAccessToken());
+    } catch {
+      // Logged out, or the refresh endpoint was unreachable — the SDK's own
+      // cached token below may still get us in.
+    }
+    const cached = await loadAppRemoteToken();
+    if (cached != null && !tokens.includes(cached)) tokens.push(cached);
+    return tokens;
   }, []);
 
-  // Recorded so a cold start can resume rather than restart — see
-  // playbackPosition.ts. Only a playlist context is worth remembering: anything
-  // else (an album, a radio session started from Spotify itself) isn't
-  // something this app can resume into.
-  const persistPosition = useCallback(() => {
-    const playlistId = playlistIdFromContextUri(contextUriRef.current);
-    const trackUri = trackUriRef.current;
-    if (playlistId == null || trackUri == null) return;
-    void savePlaybackPosition({ playlistId, trackUri, positionMs: livePositionMs() });
-  }, [livePositionMs]);
+  /**
+   * Attaches to Spotify, waking it if it isn't running, WITHOUT choosing what
+   * plays.
+   *
+   * `connect()` can't wake a suspended Spotify; only `authorizeAndPlayURI` can,
+   * and it starts something playing as a side effect. The URI it's given is
+   * therefore what a cold start ends up playing — which is why it gets a blank
+   * one here. The SDK documents the empty string as "attempt to play the user's
+   * last song" (SPTAppRemote.h), so Spotify comes back on whatever the user was
+   * listening to instead of being hijacked onto a playlist of ours.
+   *
+   * Passing a playlist URI here instead is a real bug that shipped: it made a
+   * tap on Play switch the song every time Spotify wasn't already awake.
+   */
+  const connectOrWake = useCallback(async () => {
+    ensureConfigured();
+    setPlayerError(null);
+    if (connectionRef.current === 'connected') return;
+
+    setConnection('connecting');
+    for (const token of await connectTokens()) {
+      try {
+        // Set before awaiting, not after: the connection event reaches JS ahead
+        // of this promise resolving, so anything reacting to 'connected' has to
+        // be able to read the origin already.
+        connectionOriginRef.current = 'resumedSession';
+        await SpotifyAppRemote.connectWithAccessToken(token);
+        return;
+      } catch {
+        // Either Spotify is suspended (connect can't wake it) or the token was
+        // rejected. Try the next one, then fall through to waking it.
+      }
+    }
+
+    connectionOriginRef.current = 'wokeSpotify';
+    const installed = await SpotifyAppRemote.authorizeAndPlay('');
+    setSpotifyInstalled(installed);
+    if (!installed) {
+      setConnection('disconnected');
+      setPlayerError(SPOTIFY_NOT_INSTALLED);
+    }
+  }, [connectTokens, ensureConfigured]);
 
   const applyPlayerState = useCallback((state: NativePlayerState) => {
     setSnapshot(toPlayerSnapshot(state));
@@ -156,8 +190,6 @@ export function useSpotifyPlayer(): SpotifyPlayer {
     playbackSpeedRef.current = state.playbackSpeed;
     positionBaseRef.current = { positionMs: state.positionMs, at: Date.now() };
     setPositionMs(state.positionMs);
-    isPausedRef.current = state.isPaused;
-    contextUriRef.current = state.contextUri;
     isTrackSavedRef.current = state.track?.isSaved ?? false;
     setIsTrackSaved(isTrackSavedRef.current);
 
@@ -181,13 +213,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
           .catch(() => {});
       }
     }
-
-    // Every push is a discrete event (track change, pause, resume, seek), so
-    // this writes rarely — the 250ms interpolation tick doesn't come through
-    // here. Backgrounding persists again, since playback keeps moving after the
-    // last push and the app may not get another one before iOS kills it.
-    persistPosition();
-  }, [persistPosition]);
+  }, []);
 
   useEffect(() => {
     ensureConfigured();
@@ -211,17 +237,11 @@ export function useSpotifyPlayer(): SpotifyPlayer {
       if (event.error) console.log('[spotify] app remote connection error:', event.error);
     });
     const tokenSub = SpotifyAppRemote.addListener('onAccessToken', (event) => {
-      SecureStore.setItemAsync(APP_REMOTE_TOKEN_KEY, event.accessToken);
+      saveAppRemoteToken(event.accessToken);
     });
 
     const appStateSub = AppState.addEventListener('change', (state) => {
-      if (state !== 'active') {
-        // Last chance to record where playback got to: iOS can kill a
-        // backgrounded app without another player-state push ever arriving, and
-        // that push is the only other thing that writes this.
-        persistPosition();
-        return;
-      }
+      if (state !== 'active') return;
 
       if (connectionRef.current === 'connected') {
         // Position drifts while backgrounded — playback continues in Spotify.
@@ -236,11 +256,19 @@ export function useSpotifyPlayer(): SpotifyPlayer {
       // if there was a connection to begin with; failure is expected whenever
       // Spotify is fully suspended, and just leaves the Play button showing.
       if (!hasEverConnectedRef.current) return;
-      loadToken().then((token) => {
-        if (!token) return;
-        connectionOriginRef.current = 'resumedSession';
-        SpotifyAppRemote.connectWithAccessToken(token).catch(() => {});
-      });
+      void (async () => {
+        for (const token of await connectTokens()) {
+          try {
+            connectionOriginRef.current = 'resumedSession';
+            await SpotifyAppRemote.connectWithAccessToken(token);
+            return;
+          } catch {
+            // Expected whenever Spotify is fully suspended. Deliberately never
+            // escalates to a wake — this is a silent reconnect, and waking
+            // Spotify would start playing music nobody asked for.
+          }
+        }
+      })();
     });
 
     return () => {
@@ -250,7 +278,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
       appStateSub.remove();
       SpotifyAppRemote.disconnect().catch(() => {});
     };
-  }, [applyPlayerState, ensureConfigured, loadToken, persistPosition]);
+  }, [applyPlayerState, connectTokens, ensureConfigured]);
 
   // The SDK only pushes position on discrete state changes, so the bar
   // interpolates between pushes rather than sitting still until the next one.
@@ -279,8 +307,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
       }
 
       setConnection('connecting');
-      const token = await loadToken();
-      if (token) {
+      for (const token of await connectTokens()) {
         try {
           // Set before awaiting, not after: the connection event reaches JS
           // ahead of this promise resolving, so anything reacting to
@@ -289,11 +316,14 @@ export function useSpotifyPlayer(): SpotifyPlayer {
           await SpotifyAppRemote.connectWithAccessToken(token);
           return;
         } catch {
-          // Cached token rejected (revoked/expired) — fall through to a fresh
+          // Nothing to attach to — Spotify is suspended (connect cannot wake
+          // it) or the token was rejected outright. Fall through to a fresh
           // app-switch authorization below.
         }
       }
 
+      // Unlike connectOrWake above, this one is meant to change what's playing:
+      // its callers are asking for this specific playlist.
       connectionOriginRef.current = 'wokeSpotify';
       const installed = await SpotifyAppRemote.authorizeAndPlay(uri);
       setSpotifyInstalled(installed);
@@ -302,7 +332,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
         setPlayerError(SPOTIFY_NOT_INSTALLED);
       }
     },
-    [ensureConfigured, loadToken]
+    [connectTokens, ensureConfigured]
   );
 
   const lastConnectionOrigin = useCallback(() => connectionOriginRef.current, []);
@@ -385,7 +415,6 @@ export function useSpotifyPlayer(): SpotifyPlayer {
     setConnection('disconnected');
     setSnapshot(null);
     trackUriRef.current = null;
-    contextUriRef.current = null;
     connectionOriginRef.current = null;
     albumArtCacheRef.current.clear();
     setAlbumArtUri(null);
@@ -401,6 +430,7 @@ export function useSpotifyPlayer(): SpotifyPlayer {
     isTrackSaved,
     albumArtUri,
     playPlaylist,
+    connectOrWake,
     lastConnectionOrigin,
     setShuffleOff,
     togglePlayPause,

@@ -2,7 +2,7 @@ import * as AuthSession from 'expo-auth-session';
 import * as SecureStore from 'expo-secure-store';
 import { assertClientIdConfigured, REDIRECT_URI, SCOPES, SPOTIFY_CLIENT_ID } from './config';
 import { clearLikedSongsCache } from './likedSongsCache';
-import { clearAppRemoteToken } from './spotifyPlayer';
+import { clearAppRemoteToken } from './appRemoteToken';
 
 const DISCOVERY = {
   authorizationEndpoint: 'https://accounts.spotify.com/authorize',

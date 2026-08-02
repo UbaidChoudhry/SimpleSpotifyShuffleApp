@@ -7,22 +7,21 @@ import { clearTokens, isLoggedIn, login } from './src/auth';
 import { clearCurrentPlaylistId, loadCurrentPlaylistId } from './src/currentPlaylist';
 import { clearLikedSongsCache } from './src/likedSongsCache';
 import { NowPlayingScreen } from './src/NowPlayingScreen';
-import { clearPlaybackPosition, loadPlaybackPosition, PlaybackPosition } from './src/playbackPosition';
-import {
-  NoActiveDeviceError,
-  resumePlaylistAt,
-  shuffleLikedSongsIntoPlaylist,
-  startPlaylistFromTop,
-} from './src/spotifyApi';
+import { NoActiveDeviceError, shuffleLikedSongsIntoPlaylist, startPlaylistFromTop } from './src/spotifyApi';
 import { useSpotifyPlayer } from './src/spotifyPlayer';
 
 WebBrowser.maybeCompleteAuthSession();
 
 const CACHE_CLEARED_NOTICE = 'Cached library cleared. The next shuffle will do a full resync.';
 
-// Spotify keeps its own position when it stays alive between sessions, so a
-// remembered offset this close to where it already is isn't worth a seek.
-const POSITION_DRIFT_TOLERANCE_MS = 3000;
+// A Spotify that was just woken is still bringing playback back up, so its
+// first reported state can be empty for a moment. Taking that at face value
+// would start the playlist over the top of the song it was about to resume, so
+// a wake gets a few tries before "nothing playing" is believed.
+const WAKE_SETTLE_ATTEMPTS = 6;
+const WAKE_SETTLE_INTERVAL_MS = 400;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type Status =
   | { kind: 'checking' }
@@ -34,10 +33,11 @@ type Status =
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'checking' });
   const player = useSpotifyPlayer();
-  // A tap on Play that had to wake Spotify first. App Remote's connection lands
-  // asynchronously, well after playPlaylist resolves, so the work that needs a
-  // live connection is deferred to the effect below.
-  const pendingPlayRef = useRef<{ playlistId: string; position: PlaybackPosition | null } | null>(null);
+  // The playlist a tap on Play should fall back to, held while App Remote
+  // connects. The connection lands asynchronously, well after playPlaylist
+  // resolves, so the work that needs a live connection — deciding whether
+  // Spotify already has something to pick up — is deferred to the effect below.
+  const pendingPlayRef = useRef<string | null>(null);
 
   useEffect(() => {
     isLoggedIn()
@@ -61,73 +61,49 @@ export default function App() {
   }, []);
 
   /**
-   * Gets music going, picking up from `remembered` where that's still the best
-   * information available.
+   * Gets music going without disturbing what Spotify is already on.
    *
-   * Only ever called with a live App Remote connection, which is what makes the
-   * server-side resume legal here — it needs a device Spotify counts as active,
-   * and waking Spotify is App Remote's job (see handlePlay).
+   * Whatever the Spotify app still has loaded — playing or paused, this
+   * playlist or something else entirely — is the user's current place, so it is
+   * picked up as-is. The shuffle playlist is only started when Spotify has
+   * nothing loaded at all.
+   *
+   * Only ever called with a live App Remote connection: reading Spotify's state
+   * is the whole point, and there is nothing to read until one exists. Pass
+   * `justWoken` when that connection came from waking Spotify, which reports an
+   * empty player for a moment while playback comes back up.
    */
-  const startPlayback = async (
-    playlistId: string,
-    remembered: PlaybackPosition | null,
-    spotifyWasWoken: boolean
-  ) => {
-    const contextUri = `spotify:playlist:${playlistId}`;
-    const state = await player.readState();
-    const onPlaylist = state != null && state.contextUri === contextUri;
+  const startPlayback = async (playlistId: string, justWoken: boolean) => {
+    const attempts = justWoken ? WAKE_SETTLE_ATTEMPTS : 1;
 
-    // A session already on this playlist that this app didn't just start
-    // outranks anything remembered: Spotify never lost the user's place, while
-    // the saved position is only as fresh as the last state push before this
-    // app stopped running. The remembered position is for the case Spotify
-    // can't cover — it was asleep, or it has since moved on to something else.
-    const target = remembered != null && (spotifyWasWoken || !onPlaylist) ? remembered : null;
-
-    if (target != null && !(onPlaylist && state?.track?.uri === target.trackUri)) {
-      try {
-        await resumePlaylistAt(target);
-        return;
-      } catch (err) {
-        // Spotify only takes playback commands while it has an active device,
-        // and a session left paused for a while stops being one. Losing the
-        // resume point is a much smaller failure than refusing to play at all,
-        // so fall through to a plain start rather than dead-ending here.
-        if (!(err instanceof NoActiveDeviceError)) throw err;
-      }
-    }
-
-    if (state == null || !onPlaylist) {
-      await player.playPlaylist(playlistId);
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await delay(WAKE_SETTLE_INTERVAL_MS);
+      const state = await player.readState();
+      // A null reading is a failed read, not an empty player — either way it
+      // says nothing about what Spotify has loaded, and starting the playlist
+      // on the strength of it would wipe out the very thing being protected.
+      if (state?.track == null) continue;
+      if (state.isPaused) await player.resume();
       return;
     }
 
-    // Already sitting on the right track, so nothing needs repointing — it only
-    // has to start moving again.
-    if (target != null && Math.abs(state.positionMs - target.positionMs) > POSITION_DRIFT_TOLERANCE_MS) {
-      await player.seekTo(target.positionMs);
-    }
-    if (state.isPaused) await player.resume();
+    await player.playPlaylist(playlistId);
   };
 
   const handlePlay = async (playlistId: string) => {
-    const remembered = await loadPlaybackPosition();
-    // Every shuffle lands in a new playlist, so a position saved against a
-    // different one has nothing left to point at.
-    const position = remembered?.playlistId === playlistId ? remembered : null;
-
     if (player.connection === 'connected') {
-      await startPlayback(playlistId, position, false);
+      await startPlayback(playlistId, false);
       return;
     }
 
-    // Cold start. Waking Spotify has to go through App Remote — there is no
-    // active device for a server-side command to reach yet — and that always
-    // begins the playlist at its first track, with no offset to pass. The
-    // remembered position is reapplied once the connection lands.
-    pendingPlayRef.current = { playlistId, position };
+    // Not connected yet, so there is no state to read. connectOrWake attaches
+    // to a running Spotify without touching playback, and wakes a suspended one
+    // onto the user's own last song rather than onto this playlist — either way
+    // it lands on something of the user's, which the effect below then reads
+    // back. Only if that read comes up genuinely empty does the playlist start.
+    pendingPlayRef.current = playlistId;
     try {
-      await player.playPlaylist(playlistId);
+      await player.connectOrWake();
     } catch (err) {
       pendingPlayRef.current = null;
       console.log('[spotify] could not start playback:', err instanceof Error ? err.message : err);
@@ -136,17 +112,14 @@ export default function App() {
 
   useEffect(() => {
     if (player.connection !== 'connected') return;
-    const pending = pendingPlayRef.current;
-    if (pending == null) return;
+    const pendingPlaylistId = pendingPlayRef.current;
+    if (pendingPlaylistId == null) return;
     pendingPlayRef.current = null;
-    startPlayback(pending.playlistId, pending.position, player.lastConnectionOrigin() === 'wokeSpotify').catch(
-      (err) => {
-        // Deliberately not surfaced as an error state: that would tear down the
-        // now-playing screen over a failure whose worst outcome is playing from
-        // the top of the playlist, which is where Spotify already is.
-        console.log('[spotify] could not resume where playback left off:', err instanceof Error ? err.message : err);
-      }
-    );
+    startPlayback(pendingPlaylistId, player.lastConnectionOrigin() === 'wokeSpotify').catch((err) => {
+      // Deliberately not surfaced as an error state: that would tear down the
+      // now-playing screen over a failure the user can retry by tapping Play.
+      console.log('[spotify] could not start playback:', err instanceof Error ? err.message : err);
+    });
   }, [player.connection]);
 
   const handleShuffle = async () => {
@@ -171,9 +144,6 @@ export default function App() {
     }
     try {
       const result = await shuffleLikedSongsIntoPlaylist((message) => setStatus({ kind: 'busy', message }));
-      // The old playlist is gone and the new one starts at its top, so anything
-      // remembered about the previous one is now stale.
-      await clearPlaybackPosition();
       setStatus({ kind: 'idle', playlistId: result.playlistId, trackCount: result.trackCount });
       if (isConnected) {
         await player.setShuffleOff();
@@ -219,7 +189,6 @@ export default function App() {
     await player.disconnect();
     // Otherwise the next account inherits a pointer to a playlist it doesn't own.
     await clearCurrentPlaylistId();
-    await clearPlaybackPosition();
     await clearTokens();
     setStatus({ kind: 'loggedOut' });
   };
